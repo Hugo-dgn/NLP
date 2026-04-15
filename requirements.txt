@@ -1,0 +1,14 @@
+# PyTorch (install separately following official instructions)
+# https://pytorch.org/get-started/previous-versions/
+
+transformers==5.5.0
+datasets==4.8.4
+openai==2.31.5
+langchain==1.2.15
+langchain-openai==1.1.12
+sentencepiece==0.2.1
+trl==1.0.0
+accelerate==1.13.0
+peft==0.18.1
+pandas==3.0.2
+pyrallis==0.3.1
