@@ -1,3 +1,11 @@
 venv
 
 __pycache__
+*slurm*
+
+checkpoints
+*log*
+*.yaml
+wandb
+phase*
+.vscode

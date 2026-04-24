@@ -26,5 +26,13 @@ class Config:
     # n_eval is the number of samples on which to run the eval. n_eval=-1 means eval on all data samples
     n_eval: int = -1
 
+    #### Training parameters ####
+    num_epochs : int = 1
+    num_epochs_head: int = 50
+    train_batch_size : int = 32
+    learning_rate: float = 5e-5
+    head_learning_rate: float = 1e-4
+    weight_decay: float = 1e-3
+    grad_acc: int = 1
 
 
