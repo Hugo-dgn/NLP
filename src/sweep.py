@@ -86,5 +86,5 @@ def run_sweep(config=None):
             wandb.log({"avg_acc": avg_acc})
         
 
-sweep_id = "hugo-degeneve/NLP/b1nd94du"
+sweep_id = "hugo-degeneve/NLP/pveyxjdr"
 wandb.agent(sweep_id, run_sweep, count=50)

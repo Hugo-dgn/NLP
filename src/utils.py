@@ -3,6 +3,43 @@ from transformers import (
     TrainerCallback,
 )
 
+import re
+import unicodedata
+
+def clean_review(text: str) -> str:
+    # 1) Normalize unicode (important!)
+    text = unicodedata.normalize("NFKC", text)
+
+    # 2) Remove emojis (broad coverage)
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F300-\U0001FAFF"  # most emojis
+        "\U00002700-\U000027BF"
+        "]+",
+        flags=re.UNICODE
+    )
+    text = emoji_pattern.sub("", text)
+
+    # 3) Normalize quotes
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("‘", "'").replace("’", "'")
+
+    # 4) Remove backslashes and double quotes ONLY
+    text = re.sub(r'[\\"]', "", text)
+
+    # 5) Remove control characters (but keep newlines)
+    text = re.sub(r"[\x00-\x1F\x7F]", " ", text)
+
+    # 6) Remove weird symbols but KEEP:
+    # letters (all languages), numbers, punctuation, apostrophes
+    text = re.sub(r"[^\w\s.,!?;:'()\-\nÀ-ÿ]", " ", text)
+
+    # 7) Normalize spacing
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n+", "\n", text)
+
+    return text.strip()
+
 
 ASPECTS = ["Price", "Food", "Service"]
 LABELS = ["Positive", "Negative", "Mixed", "No Opinion"]
@@ -13,8 +50,8 @@ NUM_CLASSES = len(LABELS)  # 4
 def get_constant():
     return ASPECTS, LABELS, LABEL2ID, ID2LABEL, NUM_CLASSES
 
-def clean_review(text):
-    return text.replace('"', '')
+"""def clean_review(text):
+    return text.replace('"', '')"""
 
 def normalize_label(raw: str) -> str:
     """

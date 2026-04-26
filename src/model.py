@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 
 import torch
+from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import torch.nn as nn
-import numpy as np
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -11,6 +11,7 @@ from transformers import (
 from transformers.modeling_outputs import ModelOutput
 
 import utils
+from data import EmbeddingDataset
 
 ASPECTS, LABELS, LABEL2ID, ID2LABEL, NUM_CLASSES = utils.get_constant()
 
@@ -54,10 +55,55 @@ class HeadsOnlyModel(nn.Module):
             loss = sum(
                 self.loss_fns[i](logits_list[i], labels[:, i])
                 for i in range(len(ASPECTS))
-            )
+            ) / len(ASPECTS)
 
         return ThreeHeadOutput(loss=loss, logits=logits)
 
+def get_clean_indices(
+    emb_train: EmbeddingDataset,
+    heads_model: HeadsOnlyModel,
+    tau: float = 0.9,
+) -> torch.Tensor:
+    """
+    Fits a 2-component GMM to the per-sample loss returned directly by the
+    model and returns the indices of samples whose posterior probability of
+    belonging to the low-loss (clean) Gaussian component is >= tau.
+
+    Args:
+        emb_train:   EmbeddingDataset of precomputed embeddings + noisy labels.
+        heads_model: HeadsOnlyModel whose current weights define the loss.
+        tau:         GMM clean-probability threshold (default 0.5).
+        batch_size:  Batch size for loss computation.
+
+    Returns:
+        clean_indices: 1D torch.Tensor of integer indices into emb_train.
+    """
+    device = next(heads_model.parameters()).device
+    heads_model.eval()
+
+    all_losses = []
+    loader = DataLoader(emb_train, batch_size=1, shuffle=False)
+
+    with torch.no_grad():
+        for batch in loader:
+            emb    = batch["embeddings"].to(device)
+            labels = batch["labels"].to(device)
+
+            output = heads_model(embeddings=emb, labels=labels)
+            all_losses.append(output.loss.cpu())
+
+    all_losses = torch.stack(all_losses)  # (N,)
+
+    threshold = torch.quantile(all_losses, tau)
+    clean_indices = torch.where(all_losses < threshold)[0]                          # (N,)
+
+    print(
+        f"GMM separation: {len(clean_indices)} clean / "
+        f"{len(all_losses) - len(clean_indices)} noisy "
+        f"(tau={tau}, total={len(all_losses)})"
+    )
+
+    return clean_indices
 
 # ---------------------------------------------------------------------------
 # Mixup
@@ -70,6 +116,7 @@ class MixupEmbedding(nn.Module):
         super().__init__()
         self.alpha = alpha
         self.mix_prob = mix_prob  # percentage of batch to mix
+        self.beta = torch.distributions.Beta(self.alpha, self.alpha)
 
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor, num_classes: int):
 
@@ -90,7 +137,7 @@ class MixupEmbedding(nn.Module):
         # Shuffle for pairing
         shuffle_indices = mix_indices[torch.randperm(num_mix)]
 
-        lam = np.random.beta(self.alpha, self.alpha)
+        lam = self.beta.sample()
 
         # Clone to avoid in-place issues
         mixed_embeddings = embeddings.clone()

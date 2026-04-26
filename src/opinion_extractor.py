@@ -123,6 +123,7 @@ class OpinionExtractor:
         weight_decay    = getattr(self.cfg, "weight_decay",     0.01)
         head_lr         = getattr(self.cfg, "head_learning_rate", 1e-3)
         lr              = getattr(self.cfg, "learning_rate",      2e-5)
+        tau = getattr(self.cfg, "tau",      0.95)
         gradient_accumulation_steps = getattr(self.cfg, "grad_acc", 16)
 
         # -----------------------------------------------------------------
@@ -143,7 +144,8 @@ class OpinionExtractor:
         class_weights = self._compute_class_weights(train_data)
         for head_idx, w in enumerate(class_weights):
             continue
-            self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(weight=w.to(self.device), label_smoothing=0.1)
+            self.model.loss_fns[head_idx] = FocalLoss(gamma=2.0)
+            #self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(weight=w.to(self.device), label_smoothing=0.1)
 
         # -----------------------------------------------------------------
         # Phase 1: heads only on precomputed embeddings (encoder never called)
@@ -184,6 +186,9 @@ class OpinionExtractor:
             # Clear embeddings: phase 2 uses the full encoder via utils.evaluate
             eval_callback.train_emb = None
             eval_callback.val_emb   = None
+            
+        clean_indices = model.get_clean_indices(emb_train, heads_model, tau)
+        clean_train_dataset = torch.utils.data.Subset(train_dataset, clean_indices.tolist())
 
         # -----------------------------------------------------------------
         # Phase 2: full fine-tuning (encoder unfrozen)
@@ -226,7 +231,7 @@ class OpinionExtractor:
                 weight_decay=weight_decay,
                 gradient_accumulation_steps=gradient_accumulation_steps,
             ),
-            train_dataset=train_dataset,
+            train_dataset=clean_train_dataset,
             eval_dataset=val_dataset,
             data_collator=collator,
             callbacks=[eval_callback],

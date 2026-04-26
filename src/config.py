@@ -36,5 +36,6 @@ class Config:
     grad_acc: int = 2
     mix_alpha: float = 0.3640517432260951
     mix_prob: float = 0.400956714339144
+    tau : float = 0.95
 
 
