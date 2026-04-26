@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
+import numpy as np
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -57,7 +59,55 @@ class HeadsOnlyModel(nn.Module):
         return ThreeHeadOutput(loss=loss, logits=logits)
 
 
+# ---------------------------------------------------------------------------
+# Mixup
+# ---------------------------------------------------------------------------
 
+
+
+class MixupEmbedding(nn.Module):
+    def __init__(self, alpha: float = 0.3, mix_prob: float = 0.4):
+        super().__init__()
+        self.alpha = alpha
+        self.mix_prob = mix_prob  # percentage of batch to mix
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor, num_classes: int):
+
+        if not self.training or labels is None:
+            return embeddings, labels
+
+        B = embeddings.size(0)
+
+        # One-hot labels
+        soft_labels = F.one_hot(labels, num_classes).float()
+
+        # Decide how many samples to mix
+        num_mix = int(self.mix_prob * B)
+
+        # Random subset of indices to mix
+        mix_indices = torch.randperm(B, device=embeddings.device)[:num_mix]
+
+        # Shuffle for pairing
+        shuffle_indices = mix_indices[torch.randperm(num_mix)]
+
+        lam = np.random.beta(self.alpha, self.alpha)
+
+        # Clone to avoid in-place issues
+        mixed_embeddings = embeddings.clone()
+        mixed_labels = soft_labels.clone()
+
+        # Apply mixup only on subset
+        mixed_embeddings[mix_indices] = (
+            lam * embeddings[mix_indices] +
+            (1 - lam) * embeddings[shuffle_indices]
+        )
+
+        mixed_labels[mix_indices] = (
+            lam * soft_labels[mix_indices] +
+            (1 - lam) * soft_labels[shuffle_indices]
+        )
+
+        return mixed_embeddings, mixed_labels
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +120,7 @@ class ThreeHeadTransformerClassifier(nn.Module):
     one per aspect (Price, Food, Service), each predicting 4 classes.
     """
 
-    def __init__(self, plm_name: str, num_classes: int = NUM_CLASSES, dropout: float = 0.1):
+    def __init__(self, plm_name: str, num_classes: int = NUM_CLASSES, mix_alpha: float = 0.3, mix_prob: float = 0.4, dropout: float = 0.1):
         super().__init__()
         self.config = AutoConfig.from_pretrained(plm_name)
         self.encoder = AutoModel.from_pretrained(
@@ -79,6 +129,8 @@ class ThreeHeadTransformerClassifier(nn.Module):
             device_map=None,
         )
         emb_dim = self.config.hidden_size
+        
+        self.mixup = MixupEmbedding(mix_alpha, mix_prob)
 
         # One classification head per aspect
         self.heads = nn.ModuleList([
@@ -95,7 +147,7 @@ class ThreeHeadTransformerClassifier(nn.Module):
         ])
 
         # One cross-entropy loss per head (weights are set later from train data)
-        self.loss_fns = nn.ModuleList([nn.CrossEntropyLoss() for _ in ASPECTS])
+        self.loss_fns = [nn.CrossEntropyLoss(label_smoothing=0.1) for _ in ASPECTS]
 
         # Freeze the encoder at init: only heads are trained during phase 1
         for param in self.encoder.parameters():
@@ -122,6 +174,8 @@ class ThreeHeadTransformerClassifier(nn.Module):
     ) -> ThreeHeadOutput:
         encoder_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         pooled = self._pool(encoder_out.last_hidden_state, attention_mask)  # (N, emb_dim)
+        
+        pooled, labels = self.mixup(pooled, labels, num_classes=4)
 
         logits_list = [head(pooled) for head in self.heads]  # 3 x (N, 4)
         logits = torch.stack(logits_list, dim=1)              # (N, 3, 4)
@@ -131,6 +185,6 @@ class ThreeHeadTransformerClassifier(nn.Module):
             # labels shape: (N, 3)
             loss = sum(
                 self.loss_fns[i](logits_list[i], labels[:, i]) for i in range(len(ASPECTS))
-            )
+            ) / len(ASPECTS)
 
         return ThreeHeadOutput(loss=loss, logits=logits)

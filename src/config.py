@@ -27,12 +27,14 @@ class Config:
     n_eval: int = -1
 
     #### Training parameters ####
-    num_epochs : int = 1
-    num_epochs_head: int = 50
+    num_epochs : int = 4
+    num_epochs_head: int = 30
     train_batch_size : int = 32
-    learning_rate: float = 5e-5
-    head_learning_rate: float = 1e-4
-    weight_decay: float = 1e-3
-    grad_acc: int = 1
+    learning_rate: float = 0.00007096281310557884
+    head_learning_rate: float = 0.0009070036730760508
+    weight_decay: float = 0.00014901968993233502
+    grad_acc: int = 2
+    mix_alpha: float = 0.3640517432260951
+    mix_prob: float = 0.400956714339144
 
 

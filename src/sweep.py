@@ -19,7 +19,8 @@ def load_data():
     df_train = pd.read_csv("../data/ftdataset_train.tsv", sep=' *\t *', encoding='utf-8', engine='python').to_dict(orient='records')
     df_val = pd.read_csv("../data/ftdataset_val.tsv", sep=' *\t *', encoding='utf-8', engine='python').to_dict(orient='records')
     try:
-        df_test = pd.read_csv("../data/ftdataset_test.tsv", sep=' *\t *', encoding='utf-8', engine='python').to_dict(orient='records')
+        #df_test = pd.read_csv("../data/ftdataset_test.tsv", sep=' *\t *', encoding='utf-8', engine='python').to_dict(orient='records')
+        df_test = pd.read_csv("../data/curated_data.csv").to_dict(orient='records')
     except:
         df_test = None
     return (
@@ -85,5 +86,5 @@ def run_sweep(config=None):
             wandb.log({"avg_acc": avg_acc})
         
 
-sweep_id = "hugo-degeneve/NLP/4ly3cg0o"
+sweep_id = "hugo-degeneve/NLP/b1nd94du"
 wandb.agent(sweep_id, run_sweep, count=50)

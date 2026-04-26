@@ -36,9 +36,16 @@ class OpinionExtractor:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         self.plm_name = PLM_NAME
+        
+        # -----------------------------------------------------------------
+        # Hyperparameters
+        # -----------------------------------------------------------------
+        mix_alpha = getattr(self.cfg, "mix_alpha", 0.3)
+        mix_prob = getattr(self.cfg, "mix_prob", 0.4)
+        
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.plm_name)
-        self.model = model.ThreeHeadTransformerClassifier(self.plm_name)
+        self.model = model.ThreeHeadTransformerClassifier(self.plm_name, mix_alpha=mix_alpha, mix_prob=mix_prob)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -106,14 +113,6 @@ class OpinionExtractor:
         Phase 2 (num_epochs epochs): encoder unfrozen, AdamW at learning_rate.
         Best model (by val macro_acc) is restored at the end.
         """
-        # -----------------------------------------------------------------
-        # Class weights
-        # -----------------------------------------------------------------
-        print("Computing per-aspect class weights from training data...")
-        class_weights = self._compute_class_weights(train_data)
-        for head_idx, w in enumerate(class_weights):
-            continue
-            self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(weight=w.to(self.device))
 
         # -----------------------------------------------------------------
         # Hyperparameters
@@ -135,6 +134,16 @@ class OpinionExtractor:
 
         # Shared callback — tracks best model across both phases
         eval_callback = utils.EvalCallback(self, train_data, val_data)
+        
+        
+        # -----------------------------------------------------------------
+        # Class weights
+        # -----------------------------------------------------------------
+        print("Computing per-aspect class weights from training data...")
+        class_weights = self._compute_class_weights(train_data)
+        for head_idx, w in enumerate(class_weights):
+            continue
+            self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(weight=w.to(self.device), label_smoothing=0.1)
 
         # -----------------------------------------------------------------
         # Phase 1: heads only on precomputed embeddings (encoder never called)
@@ -201,7 +210,7 @@ class OpinionExtractor:
         num_warmup_steps = int(0.1 * num_training_steps)
         
         lr_scheduler = get_scheduler(
-            name="constant",  # same as lr_scheduler_type
+            name="cosine",  # same as lr_scheduler_type
             optimizer=optimizer,
             num_training_steps=num_training_steps,
             num_warmup_steps=num_warmup_steps,
@@ -231,6 +240,8 @@ class OpinionExtractor:
         if eval_callback.best_state is not None:
             print(f"\nRestoring best model (val acc={eval_callback.best_acc:.4f})")
             self.model.load_state_dict(eval_callback.best_state)
+        
+        self.model.eval()
 
     # DO NOT MODIFY THE SIGNATURE OF THIS METHOD, add code to implement it
     def predict(self, texts: list[str]) -> list[dict]:
@@ -241,6 +252,8 @@ class OpinionExtractor:
         """
         self.model.eval()
         device = self.device
+        
+        texts = [utils.clean_review(text) for text in texts]
 
         encoded = self.tokenizer(
             texts,

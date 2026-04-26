@@ -70,7 +70,7 @@ class ReviewDataset(Dataset):
     """Wraps a list of dicts from the TSV data into a torch Dataset."""
 
     def __init__(self, data: list[dict], tokenizer, max_length: int = 512):
-        self.texts = [item["Review"].replace('"', '') for item in data]
+        self.texts = [utils.clean_review(item["Review"]) for item in data]
         # Build label tensors: shape (N, 3) — one label index per aspect
         self.labels = torch.tensor(
             [

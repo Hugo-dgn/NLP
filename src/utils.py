@@ -13,6 +13,9 @@ NUM_CLASSES = len(LABELS)  # 4
 def get_constant():
     return ASPECTS, LABELS, LABEL2ID, ID2LABEL, NUM_CLASSES
 
+def clean_review(text):
+    return text.replace('"', '')
+
 def normalize_label(raw: str) -> str:
     """
     Clean noisy labels from the TSV.
