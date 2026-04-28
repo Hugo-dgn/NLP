@@ -29,13 +29,13 @@ class Config:
     #### Training parameters ####
     num_epochs : int = 4
     num_epochs_head: int = 30
-    train_batch_size : int = 32
-    learning_rate: float = 0.00007096281310557884
-    head_learning_rate: float = 0.0009070036730760508
-    weight_decay: float = 0.00014901968993233502
-    grad_acc: int = 2
-    mix_alpha: float = 0.3640517432260951
-    mix_prob: float = 0.400956714339144
-    tau : float = 0.95
+    train_batch_size : int = 16
+    learning_rate: float = 0.00009009216026423788
+    head_learning_rate: float = 0.0004907633596658253
+    weight_decay: float = 0.00432671809466857
+    grad_acc: int = 4
+    mix_alpha: float = 0.2433538197862255
+    mix_prob: float = 0.7813028630807892
+    tau : float = 0.9183992151445608
 
 

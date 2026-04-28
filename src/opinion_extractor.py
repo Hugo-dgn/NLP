@@ -3,12 +3,17 @@ from typing import Literal
 import torch
 from torch.optim import AdamW
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
     get_scheduler
 )
+
+from accelerate import Accelerator
+
+from tqdm.auto import tqdm
 
 import model
 import utils
@@ -36,23 +41,27 @@ class OpinionExtractor:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         self.plm_name = PLM_NAME
-        
+
         # -----------------------------------------------------------------
         # Hyperparameters
         # -----------------------------------------------------------------
         mix_alpha = getattr(self.cfg, "mix_alpha", 0.3)
-        mix_prob = getattr(self.cfg, "mix_prob", 0.4)
-        
+        mix_prob  = getattr(self.cfg, "mix_prob",  0.4)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.plm_name)
-        self.model = model.ThreeHeadTransformerClassifier(self.plm_name, mix_alpha=mix_alpha, mix_prob=mix_prob)
+        self.model     = model.ThreeHeadTransformerClassifier(
+            self.plm_name, mix_alpha=mix_alpha, mix_prob=mix_prob
+        )
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _compute_class_weights(self, train_data: list[dict]) -> list[torch.Tensor]:
         """
-        Compute inverse-frequency class weights for each aspect head from the training data.
-        Formula: w_c = N / (K * n_c), normalised so the mean weight == 1 (keeps loss scale stable).
+        Compute inverse-frequency class weights for each aspect head from the
+        training data.
+        Formula: w_c = N / (K * n_c), normalised so mean weight == 1.
         Returns a list of 3 float tensors of shape (NUM_CLASSES,), one per aspect.
         """
         N = len(train_data)
@@ -69,9 +78,18 @@ class OpinionExtractor:
                   " | ".join(f"{LABELS[i]}: {w[i]:.3f}" for i in range(NUM_CLASSES)))
         return weights
 
-    def _make_training_args(self, output_dir: str, num_epochs: int, lr: float,
-                            batch_size: int, weight_decay: float,
-                            gradient_accumulation_steps : int) -> TrainingArguments:
+    def _make_training_args(
+        self,
+        output_dir: str,
+        num_epochs: int,
+        lr: float,
+        batch_size: int,
+        weight_decay: float,
+        gradient_accumulation_steps: int,
+        lr_scheduler_type: str = "constant",
+        warmup_ratio: float = None,
+        report_to="none"
+    ) -> TrainingArguments:
         return TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
@@ -79,51 +97,72 @@ class OpinionExtractor:
             per_device_eval_batch_size=batch_size,
             learning_rate=lr,
             weight_decay=weight_decay,
-            lr_scheduler_type="constant",
+            lr_scheduler_type=lr_scheduler_type,
+            warmup_ratio=warmup_ratio,
             logging_strategy="epoch",
-            save_strategy="no",             # best-model saving handled by callback
-            report_to="wandb",
+            report_to=report_to,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            eval_strategy="epoch",      # was evaluation_strategy
+            save_strategy="best",
+            save_total_limit=1,
+            load_best_model_at_end=True,
+            metric_for_best_model="macro_acc",
+            greater_is_better=True,
         )
 
-    @torch.no_grad()
     def _precompute_embeddings(self, dataset: data.ReviewDataset) -> torch.Tensor:
-        """
-        Run the frozen encoder over the full dataset in mini-batches and
-        return mean-pooled embeddings of shape (N, emb_dim) on CPU.
-        """
-        self.model.encoder.eval()
-        self.model.encoder.to(self.device)
+        accelerator = Accelerator()
+        
         collator = data.AspectCollator(pad_token_id=self.tokenizer.pad_token_id)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=64, collate_fn=collator)
+        loader   = torch.utils.data.DataLoader(
+            dataset, batch_size=64, collate_fn=collator
+        )
+
+        # prepare() moves the encoder and dataloader to the correct device
+        # for this process (cuda:0, cuda:1, cpu, etc.)
+        encoder, loader = accelerator.prepare(self.model.encoder, loader)
+        encoder.eval()
+
         all_embeddings = []
         for batch in loader:
-            input_ids      = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            out = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
-            pooled = self.model._pool(out.last_hidden_state, attention_mask)
-            all_embeddings.append(pooled.cpu())
+            # batch tensors are already on the correct device — no .to() needed
+            with torch.no_grad():
+                out    = encoder(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                pooled = self.model._pool(out.last_hidden_state, batch["attention_mask"])
+                all_embeddings.append(pooled.cpu())
+
+        # unwrap so the Trainer can re-prepare it cleanly in Phase 2
+        self.model.encoder = accelerator.unwrap_model(encoder)
+
         return torch.cat(all_embeddings, dim=0)  # (N, emb_dim)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
     # DO NOT MODIFY THE SIGNATURE OF THIS METHOD, add code to implement it
     def train(self, train_data: list[dict], val_data: list[dict]) -> None:
         """
         Fine-tunes the 3-head classifier on train_data using HuggingFace Trainer.
-        Phase 1 (num_epochs_head epochs): encoder frozen, heads only, Adam at head_learning_rate.
-        Phase 2 (num_epochs epochs): encoder unfrozen, AdamW at learning_rate.
+
+        Phase 1 (num_epochs_head epochs): encoder frozen, heads only, Adam at
+            head_learning_rate, trained on precomputed embeddings.
+        Phase 2 (num_epochs epochs): encoder unfrozen, full fine-tuning with
+            a cosine LR schedule and separate LRs for encoder vs. heads.
+
         Best model (by val macro_acc) is restored at the end.
         """
 
         # -----------------------------------------------------------------
         # Hyperparameters
         # -----------------------------------------------------------------
-        num_epochs      = getattr(self.cfg, "num_epochs",         5)
-        num_epochs_head = getattr(self.cfg, "num_epochs_head",    1)
-        batch_size      = getattr(self.cfg, "train_batch_size",  16)
-        weight_decay    = getattr(self.cfg, "weight_decay",     0.01)
+        num_epochs      = getattr(self.cfg, "num_epochs",          5)
+        num_epochs_head = getattr(self.cfg, "num_epochs_head",     1)
+        batch_size      = getattr(self.cfg, "train_batch_size",   16)
+        weight_decay    = getattr(self.cfg, "weight_decay",      0.01)
         head_lr         = getattr(self.cfg, "head_learning_rate", 1e-3)
         lr              = getattr(self.cfg, "learning_rate",      2e-5)
-        tau = getattr(self.cfg, "tau",      0.95)
+        tau             = getattr(self.cfg, "tau",               0.95)
         gradient_accumulation_steps = getattr(self.cfg, "grad_acc", 16)
 
         # -----------------------------------------------------------------
@@ -133,10 +172,6 @@ class OpinionExtractor:
         val_dataset   = data.ReviewDataset(val_data,   self.tokenizer)
         collator      = data.AspectCollator(pad_token_id=self.tokenizer.pad_token_id)
 
-        # Shared callback — tracks best model across both phases
-        eval_callback = utils.EvalCallback(self, train_data, val_data)
-        
-        
         # -----------------------------------------------------------------
         # Class weights
         # -----------------------------------------------------------------
@@ -144,8 +179,9 @@ class OpinionExtractor:
         class_weights = self._compute_class_weights(train_data)
         for head_idx, w in enumerate(class_weights):
             continue
-            self.model.loss_fns[head_idx] = FocalLoss(gamma=2.0)
-            #self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(weight=w.to(self.device), label_smoothing=0.1)
+            self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(
+                weight=w, label_smoothing=0.1
+            )
 
         # -----------------------------------------------------------------
         # Phase 1: heads only on precomputed embeddings (encoder never called)
@@ -158,13 +194,9 @@ class OpinionExtractor:
             emb_train = data.EmbeddingDataset(train_emb, train_dataset.labels)
             emb_val   = data.EmbeddingDataset(val_emb,   val_dataset.labels)
 
-            # Give the callback the precomputed embeddings so it skips the encoder
-            eval_callback.train_emb = train_emb
-            eval_callback.val_emb   = val_emb
-
             # Thin wrapper that shares heads/loss_fns with the full model
             heads_model = model.HeadsOnlyModel(self.model.heads, self.model.loss_fns)
-
+            
             print(f"--- Phase 1: heads only ({num_epochs_head} epoch(s), lr={head_lr:.2e}) ---")
             phase1_trainer = Trainer(
                 model=heads_model,
@@ -174,52 +206,24 @@ class OpinionExtractor:
                     lr=head_lr,
                     batch_size=batch_size,
                     weight_decay=weight_decay,
-                    gradient_accumulation_steps=gradient_accumulation_steps
+                    gradient_accumulation_steps=gradient_accumulation_steps,
                 ),
                 train_dataset=emb_train,
                 eval_dataset=emb_val,
                 data_collator=data.embedding_collator,
-                callbacks=[eval_callback],
+                compute_metrics=utils.compute_metrics,
             )
             phase1_trainer.train()
-
-            # Clear embeddings: phase 2 uses the full encoder via utils.evaluate
-            eval_callback.train_emb = None
-            eval_callback.val_emb   = None
             
-        clean_indices = model.get_clean_indices(emb_train, heads_model, tau)
-        clean_train_dataset = torch.utils.data.Subset(train_dataset, clean_indices.tolist())
+        clean_indices      = model.get_clean_indices(emb_train, heads_model, tau)
+        clean_train_dataset = torch.utils.data.Subset(
+            train_dataset, clean_indices.tolist()
+        )
 
         # -----------------------------------------------------------------
         # Phase 2: full fine-tuning (encoder unfrozen)
         # -----------------------------------------------------------------
         print(f"\n--- Phase 2: full fine-tuning ({num_epochs} epoch(s), lr={lr:.2e}) ---")
-        self.model.unfreeze()
-        
-        # Separate parameters
-        encoder_params = list(self.model.encoder.parameters())
-        head_params = list(self.model.heads.parameters())
-
-        optimizer = AdamW(
-            [
-                {"params": encoder_params, "lr": lr},
-                {"params": head_params, "lr": head_lr},
-            ],
-            weight_decay=weight_decay,
-        )
-        
-        num_training_steps = (
-            len(train_dataset) // (batch_size * gradient_accumulation_steps)
-        ) * num_epochs
-        
-        num_warmup_steps = int(0.1 * num_training_steps)
-        
-        lr_scheduler = get_scheduler(
-            name="cosine",  # same as lr_scheduler_type
-            optimizer=optimizer,
-            num_training_steps=num_training_steps,
-            num_warmup_steps=num_warmup_steps,
-        )
 
         phase2_trainer = Trainer(
             model=self.model,
@@ -230,36 +234,31 @@ class OpinionExtractor:
                 batch_size=batch_size,
                 weight_decay=weight_decay,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                lr_scheduler_type="cosine",
+                warmup_ratio=0.1,
+                report_to="wandb"
             ),
             train_dataset=clean_train_dataset,
             eval_dataset=val_dataset,
             data_collator=collator,
-            callbacks=[eval_callback],
-            optimizers=(optimizer, lr_scheduler)
+            compute_metrics=utils.compute_metrics,
         )
         phase2_trainer.train()
 
-        # -----------------------------------------------------------------
-        # Restore best weights found across both phases
-        # -----------------------------------------------------------------
-        if eval_callback.best_state is not None:
-            print(f"\nRestoring best model (val acc={eval_callback.best_acc:.4f})")
-            self.model.load_state_dict(eval_callback.best_state)
-        
         self.model.eval()
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
     # DO NOT MODIFY THE SIGNATURE OF THIS METHOD, add code to implement it
-    def predict(self, texts: list[str]) -> list[dict]:
-        """
-        :param texts: list of reviews from which to extract the opinion values
-        :return: a list of dicts, one per input review, with keys "Price", "Food", "Service"
-                 and values from {"Positive", "Negative", "Mixed", "No Opinion"}
-        """
+    def predict(self, texts: list[str], batch_size: int = 32) -> list[dict]:
+        accelerator = Accelerator()
+
         self.model.eval()
-        device = self.device
-        
         texts = [utils.clean_review(text) for text in texts]
 
+        # Tokenize all texts upfront
         encoded = self.tokenizer(
             texts,
             truncation=True,
@@ -268,16 +267,27 @@ class OpinionExtractor:
             return_attention_mask=True,
             return_tensors="pt",
         )
-        input_ids      = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
 
-        with torch.no_grad():
-            output = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        # Wrap in a DataLoader so accelerate can handle device placement
+        dataset = TensorDataset(encoded["input_ids"], encoded["attention_mask"])
+        loader  = DataLoader(dataset, batch_size=batch_size)
 
-        # output.logits shape: (N, 3, 4) — argmax over class dimension
-        preds = output.logits.argmax(dim=-1).cpu().tolist()  # (N, 3)
+        # prepare() moves model and batches to the correct device automatically
+        model, loader = accelerator.prepare(self.model, loader)
+        model.eval()
+
+        all_preds = []
+        for input_ids, attention_mask in loader:
+            # tensors already on correct device — no .to() needed
+            with torch.no_grad():
+                output = model(input_ids=input_ids, attention_mask=attention_mask)
+            preds = output.logits.argmax(dim=-1).cpu().tolist()  # (batch, 3)
+            all_preds.extend(preds)
+
+        # unwrap so the model stays clean after predict()
+        self.model = accelerator.unwrap_model(model)
 
         return [
-            {aspect: ID2LABEL[preds[i][j]] for j, aspect in enumerate(ASPECTS)}
+            {aspect: ID2LABEL[all_preds[i][j]] for j, aspect in enumerate(ASPECTS)}
             for i in range(len(texts))
         ]

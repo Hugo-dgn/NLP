@@ -10,6 +10,8 @@ from transformers import (
 )
 from transformers.modeling_outputs import ModelOutput
 
+from accelerate import Accelerator
+
 import utils
 from data import EmbeddingDataset
 
@@ -64,41 +66,30 @@ def get_clean_indices(
     heads_model: HeadsOnlyModel,
     tau: float = 0.9,
 ) -> torch.Tensor:
-    """
-    Fits a 2-component GMM to the per-sample loss returned directly by the
-    model and returns the indices of samples whose posterior probability of
-    belonging to the low-loss (clean) Gaussian component is >= tau.
-
-    Args:
-        emb_train:   EmbeddingDataset of precomputed embeddings + noisy labels.
-        heads_model: HeadsOnlyModel whose current weights define the loss.
-        tau:         GMM clean-probability threshold (default 0.5).
-        batch_size:  Batch size for loss computation.
-
-    Returns:
-        clean_indices: 1D torch.Tensor of integer indices into emb_train.
-    """
-    device = next(heads_model.parameters()).device
+    accelerator = Accelerator()
     heads_model.eval()
 
-    all_losses = []
     loader = DataLoader(emb_train, batch_size=1, shuffle=False)
 
+    # accelerate handles device placement for model and batches
+    heads_model, loader = accelerator.prepare(heads_model, loader)
+
+    all_losses = []
     with torch.no_grad():
         for batch in loader:
-            emb    = batch["embeddings"].to(device)
-            labels = batch["labels"].to(device)
-
-            output = heads_model(embeddings=emb, labels=labels)
+            # tensors already on correct device — no .to() needed
+            output = heads_model(embeddings=batch["embeddings"], labels=batch["labels"])
             all_losses.append(output.loss.cpu())
 
-    all_losses = torch.stack(all_losses)  # (N,)
+    # unwrap so the caller gets a clean model back
+    heads_model = accelerator.unwrap_model(heads_model)
 
-    threshold = torch.quantile(all_losses, tau)
-    clean_indices = torch.where(all_losses < threshold)[0]                          # (N,)
+    all_losses    = torch.stack(all_losses)  # (N,)
+    threshold     = torch.quantile(all_losses, tau)
+    clean_indices = torch.where(all_losses < threshold)[0]
 
     print(
-        f"GMM separation: {len(clean_indices)} clean / "
+        f"Separation: {len(clean_indices)} clean / "
         f"{len(all_losses) - len(clean_indices)} noisy "
         f"(tau={tau}, total={len(all_losses)})"
     )
@@ -137,7 +128,7 @@ class MixupEmbedding(nn.Module):
         # Shuffle for pairing
         shuffle_indices = mix_indices[torch.randperm(num_mix)]
 
-        lam = self.beta.sample()
+        lam = self.beta.sample().to(embeddings.device)
 
         # Clone to avoid in-place issues
         mixed_embeddings = embeddings.clone()
@@ -194,16 +185,7 @@ class ThreeHeadTransformerClassifier(nn.Module):
         ])
 
         # One cross-entropy loss per head (weights are set later from train data)
-        self.loss_fns = [nn.CrossEntropyLoss(label_smoothing=0.1) for _ in ASPECTS]
-
-        # Freeze the encoder at init: only heads are trained during phase 1
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
-    def unfreeze(self):
-        """Unfreeze the encoder for full fine-tuning (called before phase 2)."""
-        for param in self.encoder.parameters():
-            param.requires_grad = True
+        self.loss_fns = nn.ModuleList([nn.CrossEntropyLoss(label_smoothing=0) for _ in ASPECTS])
 
     def _pool(self, last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Mean pooling that excludes padding tokens."""
