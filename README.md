@@ -1,5 +1,17 @@
 # NLP – Sentiment Analysis
 
+## Author
+
+Hugo Degeneve
+
+## Macro-average accuracy on the dev data split
+
+The method achieves 87.31 % macro-average accuracy on the dev data split. This was the average accuracy computed over the default 5 runs with :
+
+```bash
+accelerate launch runproject.py
+```
+
 ## Implementation
 
 ### Multi-device Training
@@ -123,7 +135,11 @@ The proposed method aims to learn robustly from noisy annotations. It is inspire
 
 **SelfMix: Robust Learning Against Textual Label Noise with Self-Mixup Training (Dan Qiao et al.)**
 
-This method achieves 0.87 macro-average accuracy on the dev data split.
+This method achieves 87.31 % macro-average accuracy on the dev data split. This was the average accuracy computed over the default 5 runs with :
+
+```bash
+accelerate launch runproject.py
+```
 
 ---
 
@@ -186,7 +202,7 @@ Following *SelfMix*, noisy samples are expected to produce **higher training los
 2. Rank samples by loss
 3. Keep only the top $\tau$ fraction of samples (lowest loss)
 
-This acts as a simple yet effective **data cleaning mechanism**.
+This acts as a simple yet effective **data cleaning mechanism**. We do this after phase 1 as the model only learned the general meaning of each categories. As the authors of *SelfMix* claim this is the right time to do the filter because the model couldn't have overfited those labels yet.
 
 ---
 
@@ -270,22 +286,32 @@ tau:
   max: 1
 ```
 
+
 ### Final Values
 
 ```python
-num_epochs = 4
-num_epochs_head = 30
+num_epochs = 4 # number of epochs in phase 2
+num_epochs_head = 30 # number of epochs in phase 1
 train_batch_size = 8
 
-learning_rate = 7.274375606071262e-05
-head_learning_rate = 1.1829176048272468e-05
+head_learning_rate = 7.274375606071262e-05 # lr for phase 1
+learning_rate = 1.1829176048272468e-05 # lr for phase 2
 weight_decay = 6.595780469253143e-04
 
 grad_acc = 4
-mix_alpha = 0.5195329578465342
-mix_prob = 0.2147598062440297
-tau = 0.9740003558057064
+mix_alpha = 0.5195329578465342 # alpha for the mixup in phase 2
+mix_prob = 0.2147598062440297 # probability of applying mixup in phase 2
+tau = 0.9740003558057064 # tau parameter used to clean noisy samples after phase 1
 ```
+
+## SelfMix evaluation
+
+The addition of the *selfmix* method improved the macro-accuracy by around 0.1%. It is not clear from this result that the method is significantly better. To evaluate it more carefully, a manually curated test dataset of 20 samples was selected, and the following results were obtained:
+
+* 17/20 without *selfmix*
+* 19/20 with *selfmix*
+
+This suggests a larger improvement than what was observed on the validation dataset. However, with only 20 test samples, it remains unclear whether the method provides a meaningful improvement over the baseline.
 
 ---
 

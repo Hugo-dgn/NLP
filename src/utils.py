@@ -41,7 +41,7 @@ def clean_review(text: str) -> str:
     text = re.sub(r"[\x00-\x1F\x7F]", " ", text)
 
     # 6) Remove weird symbols but KEEP:
-    # letters (all languages), numbers, punctuation, apostrophes
+    # letters, numbers, punctuation, apostrophes
     text = re.sub(r"[^\w\s.,!?;:'()\-\nÀ-ÿ]", " ", text)
 
     # 7) Normalize spacing
