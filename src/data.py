@@ -13,8 +13,6 @@ class AspectCollator:
     """
     Pads input_ids and attention_mask to the longest sequence in the batch.
     Stacks labels (shape (3,) per sample) into a (N, 3) tensor.
-    DataCollatorWithPadding cannot be used here because it tries to pad
-    the multi-label 'labels' field as if it were a sequence.
     """
 
     def __init__(self, pad_token_id: int):
@@ -42,7 +40,6 @@ class AspectCollator:
 class EmbeddingDataset(Dataset):
     """
     Stores mean-pooled encoder embeddings (precomputed, frozen) + labels.
-    Used in phase 1 so the encoder is never called during training.
     """
 
     def __init__(self, embeddings: torch.Tensor, labels: torch.Tensor):
@@ -67,11 +64,9 @@ def embedding_collator(samples: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 class ReviewDataset(Dataset):
-    """Wraps a list of dicts from the TSV data into a torch Dataset."""
 
     def __init__(self, data: list[dict], tokenizer, max_length: int = 512):
         self.texts = [utils.clean_review(item["Review"]) for item in data]
-        # Build label tensors: shape (N, 3) — one label index per aspect
         self.labels = torch.tensor(
             [
                 [LABEL2ID[utils.normalize_label(item[aspect])] for aspect in ASPECTS]

@@ -1,5 +1,17 @@
 # NLP – Sentiment Analysis
 
+## Implementation
+
+### Multi-device Training
+
+The code was designed to support multi-GPU training by relying on **Accelerate** to handle device assignment automatically. However, I did not have access to multiple GPUs to fully test this feature.
+
+### VRAM
+
+This project uses **XLM-RoBERTa-base** with a batch size of 8 and gradient accumulation of 4. It runs on less than **10 GB of VRAM**.
+
+---
+
 ## Data Analysis
 
 ### Class Imbalance
@@ -46,7 +58,6 @@ The dataset exhibits a strong class imbalance across all aspects (**Price**, **F
 * No Opinion: 59
 * Mixed: 46
 
-
 **Service**
 
 * Positive: 340
@@ -54,7 +65,7 @@ The dataset exhibits a strong class imbalance across all aspects (**Price**, **F
 * Negative: 114
 * Mixed: 26
 
-Overall, the class distributions are consistent between the training and validation sets, which is desirable for evaluation reliability.
+Overall, the class distributions are consistent between the training and validation sets, which is desirable for reliable evaluation.
 
 A simple baseline consisting of always predicting the majority class yields a macro accuracy of **64.0%**.
 
@@ -66,7 +77,7 @@ The dataset contains relatively short reviews:
 
 * Fewer than **0.5%** of samples exceed 512 tokens.
 
-This means truncation has minimal impact and most reviews can be processed without loss of information.
+This means truncation has minimal impact, and most reviews can be processed without loss of information.
 
 ---
 
@@ -108,8 +119,11 @@ The raw text data also contains formatting issues:
 
 ## Method
 
-The proposed method aims to learn robustly from noisy annotations. It is inspired by the approach introduced in:
-**"SelfMix: Robust Learning Against Textual Label Noise with Self-Mixup Training" (Dan Qiao et al.)**
+The proposed method aims to learn robustly from noisy annotations. It is inspired by:
+
+**SelfMix: Robust Learning Against Textual Label Noise with Self-Mixup Training (Dan Qiao et al.)**
+
+This method achieves 0.87 macro-average accuracy on the dev data split.
 
 ---
 
@@ -142,7 +156,7 @@ On top of the shared encoder, we add **three independent classification heads**,
 Each head is a small feedforward neural network with:
 
 * One hidden layer
-* ReLU
+* ReLU activation
 
 This design introduces minimal additional complexity while allowing aspect-specific predictions.
 
@@ -166,11 +180,11 @@ This prevents early corruption of pretrained representations and allows the mode
 
 Following *SelfMix*, noisy samples are expected to produce **higher training loss**.
 
-Procedure:
+**Procedure:**
 
 1. Compute the loss for each training sample after Stage 1
 2. Rank samples by loss
-3. Remove the top **x% highest-loss samples**
+3. Keep only the top $\tau$ fraction of samples (lowest loss)
 
 This acts as a simple yet effective **data cleaning mechanism**.
 
@@ -189,10 +203,10 @@ After filtering:
 
 Inspired by Mixup in computer vision, we interpolate between training examples in the embedding space.
 
-Given two samples $(x_i, y_i)$ and $(x_j, y_j)$:
+Given two samples $(x_i, y_i)$ and $(x_j, y_j)$ we create a new one $(\tilde{x} , \tilde{y})$:
 
 $$
-\tilde{x} = \lambda x_i + (1 - \lambda) x_j
+\tilde{x} = \lambda \times \text{encoder}(x_i) + (1 - \lambda) \times \text{encoder}(x_j)
 $$
 
 $$
@@ -202,11 +216,81 @@ $$
 where:
 
 * $\lambda \sim \text{Beta}(\alpha, \alpha)$
-* $x$ represents the encoder embeddings
-* $y$ represents the labels (one-hot encoded)
+* $\tilde{x}$ represents the encoder embeddings that is then given to the heads
+* $\tilde{y}$ represents the labels, it is a soft label.
 
 This approach:
 
 * Encourages smoother decision boundaries
 * Reduces overfitting
 * Improves robustness to label noise
+
+We apply this regularization with a probability of `mix_prob`.
+
+---
+
+## Hyperparameter Tuning
+
+Hyperparameters were tuned using a Bayesian search with reduced training epochs:
+
+* Phase 1 training: 30 epochs
+* Phase 2 training: 2 epochs (instead of 4)
+
+### Search Space
+
+```yaml
+head_learning_rate:
+  distribution: log_uniform_values
+  min: 1e-5
+  max: 1e-3
+
+learning_rate:
+  distribution: log_uniform_values
+  min: 1e-6
+  max: 1e-4
+
+weight_decay:
+  distribution: log_uniform_values
+  min: 1e-4
+  max: 1e-2
+
+mix_alpha:
+  distribution: uniform
+  min: 0.2
+  max: 0.8
+
+mix_prob:
+  distribution: uniform
+  min: 0.2
+  max: 0.8
+
+tau:
+  distribution: uniform
+  min: 0.8
+  max: 1
+```
+
+### Final Values
+
+```python
+num_epochs = 4
+num_epochs_head = 30
+train_batch_size = 8
+
+learning_rate = 7.274375606071262e-05
+head_learning_rate = 1.1829176048272468e-05
+weight_decay = 6.595780469253143e-04
+
+grad_acc = 4
+mix_alpha = 0.5195329578465342
+mix_prob = 0.2147598062440297
+tau = 0.9740003558057064
+```
+
+---
+
+## File Structure
+
+* `model.py`: Contains the implementation of the three-head classification model, as well as the head-only wrapper. The SelfMix method is also implemented here.
+* `data.py`: Contains the data loading pipeline.
+* `utils.py`: Contains constants and normalization functions.

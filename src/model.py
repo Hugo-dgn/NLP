@@ -24,24 +24,23 @@ ASPECTS, LABELS, LABEL2ID, ID2LABEL, NUM_CLASSES = utils.get_constant()
 @dataclass
 class ThreeHeadOutput(ModelOutput):
     loss: torch.Tensor | None = None
-    logits: torch.Tensor | None = None  # shape (N, 3, 4)
+    logits: torch.Tensor | None = None
 
 
 class HeadsOnlyModel(nn.Module):
     """
     Thin wrapper around the classification heads for phase 1.
-    Receives precomputed pooled embeddings directly — no encoder involved.
+    Receives precomputed pooled embeddings directly.
     Shares the same heads and loss_fns objects as ThreeHeadTransformerClassifier
     so weight updates carry over without any copying.
     """
 
-    # Trainer requires a `config` attribute to detect the model type
     config = None
 
     def __init__(self, heads: nn.ModuleList, loss_fns: nn.ModuleList):
         super().__init__()
-        self.heads    = heads     # shared reference — same tensors as the full model
-        self.loss_fns = loss_fns  # shared reference
+        self.heads    = heads
+        self.loss_fns = loss_fns
 
     def forward(
         self,
@@ -71,20 +70,17 @@ def get_clean_indices(
 
     loader = DataLoader(emb_train, batch_size=1, shuffle=False)
 
-    # accelerate handles device placement for model and batches
     heads_model, loader = accelerator.prepare(heads_model, loader)
 
     all_losses = []
     with torch.no_grad():
         for batch in loader:
-            # tensors already on correct device — no .to() needed
             output = heads_model(embeddings=batch["embeddings"], labels=batch["labels"])
             all_losses.append(output.loss.cpu())
 
-    # unwrap so the caller gets a clean model back
     heads_model = accelerator.unwrap_model(heads_model)
 
-    all_losses    = torch.stack(all_losses)  # (N,)
+    all_losses    = torch.stack(all_losses)
     threshold     = torch.quantile(all_losses, tau)
     clean_indices = torch.where(all_losses < threshold)[0]
 
@@ -115,26 +111,19 @@ class MixupEmbedding(nn.Module):
             return embeddings, labels
 
         B = embeddings.size(0)
-
-        # One-hot labels
         soft_labels = F.one_hot(labels, num_classes).float()
 
-        # Decide how many samples to mix
         num_mix = int(self.mix_prob * B)
 
-        # Random subset of indices to mix
         mix_indices = torch.randperm(B, device=embeddings.device)[:num_mix]
 
-        # Shuffle for pairing
         shuffle_indices = mix_indices[torch.randperm(num_mix)]
 
         lam = self.beta.sample().to(embeddings.device)
 
-        # Clone to avoid in-place issues
         mixed_embeddings = embeddings.clone()
         mixed_labels = soft_labels.clone()
 
-        # Apply mixup only on subset
         mixed_embeddings[mix_indices] = (
             lam * embeddings[mix_indices] +
             (1 - lam) * embeddings[shuffle_indices]
@@ -170,7 +159,6 @@ class ThreeHeadTransformerClassifier(nn.Module):
         
         self.mixup = MixupEmbedding(mix_alpha, mix_prob)
 
-        # One classification head per aspect
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(emb_dim, emb_dim),
@@ -184,34 +172,32 @@ class ThreeHeadTransformerClassifier(nn.Module):
             for _ in ASPECTS
         ])
 
-        # One cross-entropy loss per head (weights are set later from train data)
-        self.loss_fns = nn.ModuleList([nn.CrossEntropyLoss(label_smoothing=0) for _ in ASPECTS])
+        self.loss_fns = nn.ModuleList([nn.CrossEntropyLoss(label_smoothing=0.1) for _ in ASPECTS])
 
     def _pool(self, last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Mean pooling that excludes padding tokens."""
         mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
         sum_embeddings = torch.sum(last_hidden_state * mask_expanded, dim=1)
         sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-        return sum_embeddings / sum_mask  # (N, emb_dim)
+        return sum_embeddings / sum_mask
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor | None = None,
-        **kwargs,  # Trainer may forward extra keys (e.g. token_type_ids)
+        **kwargs,
     ) -> ThreeHeadOutput:
         encoder_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self._pool(encoder_out.last_hidden_state, attention_mask)  # (N, emb_dim)
+        pooled = self._pool(encoder_out.last_hidden_state, attention_mask)
         
         pooled, labels = self.mixup(pooled, labels, num_classes=4)
 
-        logits_list = [head(pooled) for head in self.heads]  # 3 x (N, 4)
-        logits = torch.stack(logits_list, dim=1)              # (N, 3, 4)
+        logits_list = [head(pooled) for head in self.heads]
+        logits = torch.stack(logits_list, dim=1)
 
         loss = None
         if labels is not None:
-            # labels shape: (N, 3)
             loss = sum(
                 self.loss_fns[i](logits_list[i], labels[:, i]) for i in range(len(ASPECTS))
             ) / len(ASPECTS)

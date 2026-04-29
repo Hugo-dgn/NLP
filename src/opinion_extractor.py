@@ -23,7 +23,6 @@ import data
 # Constants
 # ---------------------------------------------------------------------------
 
-# Authorized encoder-only model chosen: multilingual RoBERTa (French reviews)
 PLM_NAME = "FacebookAI/xlm-roberta-base"
 
 ASPECTS, LABELS, LABEL2ID, ID2LABEL, NUM_CLASSES = utils.get_constant()
@@ -45,8 +44,8 @@ class OpinionExtractor:
         # -----------------------------------------------------------------
         # Hyperparameters
         # -----------------------------------------------------------------
-        mix_alpha = getattr(self.cfg, "mix_alpha", 0.3)
-        mix_prob  = getattr(self.cfg, "mix_prob",  0.4)
+        mix_alpha = getattr(self.cfg, "mix_alpha", 0.5195329578465342)
+        mix_prob  = getattr(self.cfg, "mix_prob",  0.2147598062440297)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.plm_name)
         self.model     = model.ThreeHeadTransformerClassifier(
@@ -61,8 +60,6 @@ class OpinionExtractor:
         """
         Compute inverse-frequency class weights for each aspect head from the
         training data.
-        Formula: w_c = N / (K * n_c), normalised so mean weight == 1.
-        Returns a list of 3 float tensors of shape (NUM_CLASSES,), one per aspect.
         """
         N = len(train_data)
         weights = []
@@ -118,20 +115,16 @@ class OpinionExtractor:
             dataset, batch_size=64, collate_fn=collator
         )
 
-        # prepare() moves the encoder and dataloader to the correct device
-        # for this process (cuda:0, cuda:1, cpu, etc.)
         encoder, loader = accelerator.prepare(self.model.encoder, loader)
         encoder.eval()
 
         all_embeddings = []
         for batch in loader:
-            # batch tensors are already on the correct device — no .to() needed
             with torch.no_grad():
                 out    = encoder(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
                 pooled = self.model._pool(out.last_hidden_state, batch["attention_mask"])
                 all_embeddings.append(pooled.cpu())
 
-        # unwrap so the Trainer can re-prepare it cleanly in Phase 2
         self.model.encoder = accelerator.unwrap_model(encoder)
 
         return torch.cat(all_embeddings, dim=0)  # (N, emb_dim)
@@ -145,10 +138,8 @@ class OpinionExtractor:
         """
         Fine-tunes the 3-head classifier on train_data using HuggingFace Trainer.
 
-        Phase 1 (num_epochs_head epochs): encoder frozen, heads only, Adam at
-            head_learning_rate, trained on precomputed embeddings.
-        Phase 2 (num_epochs epochs): encoder unfrozen, full fine-tuning with
-            a cosine LR schedule and separate LRs for encoder vs. heads.
+        Phase 1 (num_epochs_head epochs): encoder frozen, heads only.
+        Phase 2 (num_epochs epochs): encoder unfrozen, full fine-tuning.
 
         Best model (by val macro_acc) is restored at the end.
         """
@@ -156,32 +147,21 @@ class OpinionExtractor:
         # -----------------------------------------------------------------
         # Hyperparameters
         # -----------------------------------------------------------------
-        num_epochs      = getattr(self.cfg, "num_epochs",          5)
-        num_epochs_head = getattr(self.cfg, "num_epochs_head",     1)
-        batch_size      = getattr(self.cfg, "train_batch_size",   16)
-        weight_decay    = getattr(self.cfg, "weight_decay",      0.01)
-        head_lr         = getattr(self.cfg, "head_learning_rate", 1e-3)
-        lr              = getattr(self.cfg, "learning_rate",      2e-5)
-        tau             = getattr(self.cfg, "tau",               0.95)
-        gradient_accumulation_steps = getattr(self.cfg, "grad_acc", 16)
+        num_epochs      = getattr(self.cfg, "num_epochs",          4)
+        num_epochs_head = getattr(self.cfg, "num_epochs_head",     30)
+        batch_size      = getattr(self.cfg, "train_batch_size",   8)
+        weight_decay    = getattr(self.cfg, "weight_decay",      0.0006595780469253143)
+        head_lr         = getattr(self.cfg, "head_learning_rate", 0.000011829176048272468)
+        lr              = getattr(self.cfg, "learning_rate",      0.00007274375606071262)
+        tau             = getattr(self.cfg, "tau",               .9740003558057064)
+        gradient_accumulation_steps = getattr(self.cfg, "grad_acc", 4)
 
         # -----------------------------------------------------------------
-        # Datasets & collator
+        # Datasets and collator
         # -----------------------------------------------------------------
         train_dataset = data.ReviewDataset(train_data, self.tokenizer)
         val_dataset   = data.ReviewDataset(val_data,   self.tokenizer)
         collator      = data.AspectCollator(pad_token_id=self.tokenizer.pad_token_id)
-
-        # -----------------------------------------------------------------
-        # Class weights
-        # -----------------------------------------------------------------
-        print("Computing per-aspect class weights from training data...")
-        class_weights = self._compute_class_weights(train_data)
-        for head_idx, w in enumerate(class_weights):
-            continue
-            self.model.loss_fns[head_idx] = nn.CrossEntropyLoss(
-                weight=w, label_smoothing=0.1
-            )
 
         # -----------------------------------------------------------------
         # Phase 1: heads only on precomputed embeddings (encoder never called)
@@ -194,7 +174,6 @@ class OpinionExtractor:
             emb_train = data.EmbeddingDataset(train_emb, train_dataset.labels)
             emb_val   = data.EmbeddingDataset(val_emb,   val_dataset.labels)
 
-            # Thin wrapper that shares heads/loss_fns with the full model
             heads_model = model.HeadsOnlyModel(self.model.heads, self.model.loss_fns)
             
             print(f"--- Phase 1: heads only ({num_epochs_head} epoch(s), lr={head_lr:.2e}) ---")
@@ -236,7 +215,6 @@ class OpinionExtractor:
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 lr_scheduler_type="cosine",
                 warmup_ratio=0.1,
-                report_to="wandb"
             ),
             train_dataset=clean_train_dataset,
             eval_dataset=val_dataset,
@@ -258,7 +236,6 @@ class OpinionExtractor:
         self.model.eval()
         texts = [utils.clean_review(text) for text in texts]
 
-        # Tokenize all texts upfront
         encoded = self.tokenizer(
             texts,
             truncation=True,
@@ -268,23 +245,19 @@ class OpinionExtractor:
             return_tensors="pt",
         )
 
-        # Wrap in a DataLoader so accelerate can handle device placement
         dataset = TensorDataset(encoded["input_ids"], encoded["attention_mask"])
         loader  = DataLoader(dataset, batch_size=batch_size)
 
-        # prepare() moves model and batches to the correct device automatically
         model, loader = accelerator.prepare(self.model, loader)
         model.eval()
 
         all_preds = []
         for input_ids, attention_mask in loader:
-            # tensors already on correct device — no .to() needed
             with torch.no_grad():
                 output = model(input_ids=input_ids, attention_mask=attention_mask)
-            preds = output.logits.argmax(dim=-1).cpu().tolist()  # (batch, 3)
+            preds = output.logits.argmax(dim=-1).cpu().tolist()
             all_preds.extend(preds)
 
-        # unwrap so the model stays clean after predict()
         self.model = accelerator.unwrap_model(model)
 
         return [
